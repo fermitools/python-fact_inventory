@@ -7,16 +7,18 @@ PostgreSQL-only. Creates decomposed read-only views for convenient access to
 host, network, hardware, and OS data from fact_inventory JSONB columns:
 
 Network views:
-  1. cmdb_host_interfaces: All interfaces with basic metadata
-  2. cmdb_host_interface_ipv4_addresses: IPv4 addresses per interface
-  3. cmdb_host_interface_ipv6_addresses: IPv6 addresses per interface
+  1. cmdb_host_interfaces_private: Private. Join keys and raw interface
+     JSONB only. Not for direct use; see cmdb_host_interfaces.
+  2. cmdb_host_interfaces: Public. All interfaces with basic metadata.
+  3. cmdb_host_interface_ipv4_addresses: IPv4 addresses per interface
+  4. cmdb_host_interface_ipv6_addresses: IPv6 addresses per interface
 
 Hardware views:
-  4. cmdb_host_hardware: CPU, architecture, chassis, and hardware metadata
-  5. cmdb_host_storage_devices: Storage device metadata with partition info
+  5. cmdb_host_hardware: CPU, architecture, chassis, and hardware metadata
+  6. cmdb_host_storage_devices: Storage device metadata with partition info
 
 OS view:
-  6. cmdb_host_os_info: Operating system metadata (kernel, distribution)
+  7. cmdb_host_os_info: Operating system metadata (kernel, distribution)
 
 All extracted columns are documented with JSON path references in the
 per-view docstrings below.
@@ -39,9 +41,11 @@ down_revision = "000000000000"
 branch_labels = None
 depends_on = None
 
-# Views in dependency order: the ipv4/ipv6 address views select from
-# cmdb_host_interfaces, so it must be created first and dropped last.
+# Views in dependency order: cmdb_host_interfaces (public) and the ipv4/ipv6
+# address views all select from cmdb_host_interfaces_private, so it must be
+# created first and dropped last.
 CMDB_VIEWS = (
+    "cmdb_host_interfaces_private",
     "cmdb_host_interfaces",
     "cmdb_host_interface_ipv4_addresses",
     "cmdb_host_interface_ipv6_addresses",
@@ -61,6 +65,7 @@ def upgrade() -> None:
     if not _is_postgresql():
         return
 
+    _create_cmdb_host_interfaces_private()
     _create_cmdb_host_interfaces()
     _create_cmdb_host_interface_ipv4_addresses()
     _create_cmdb_host_interface_ipv6_addresses()
@@ -73,7 +78,7 @@ def downgrade() -> None:
     """Drop all CMDB views. No-op on non-PostgreSQL dialects.
 
     Dropped in reverse creation order so dependent views are removed before
-    the cmdb_host_interfaces view they select from.
+    the cmdb_host_interfaces_private view they select from.
     """
     if not _is_postgresql():
         return
@@ -85,46 +90,69 @@ def downgrade() -> None:
 # --- View definitions -------------------------------------------------------
 
 
-def _create_cmdb_host_interfaces() -> None:
-    """Create cmdb_host_interfaces view.
+def _create_cmdb_host_interfaces_private() -> None:
+    """Create cmdb_host_interfaces_private view.
+
+    Private. Not for direct use - see cmdb_host_interfaces for the
+    public-facing view over this data.
 
     Extracts all non-loopback interfaces from system_facts JSONB.
-    One row per interface per stored record.
+    One row per interface per stored record. Carries only join/identifying
+    keys and the raw per-interface JSONB; field decoding is left to the
+    views that select from this one, so this view has nothing to keep in
+    sync with them.
 
     Filtering:
       - Only extracts actual network interfaces (those with 'device' field)
       - Excludes metadata objects like default_ipv4, python, selinux, etc.
       - Excludes loopback interface (lo)
 
-    The raw per-interface JSONB is exposed as ``interface_data`` so the
-    dependent address views can read it directly instead of joining back to
-    fact_inventory, which under hash partitioning would scan every partition.
-
-    JSON paths:
-      - fqdn: system_facts.fqdn
-      - device_type: system_facts.{interface_name}.type
-      - mac_address: system_facts.{interface_name}.macaddress
-      - is_active: system_facts.{interface_name}.active
-      - mtu: system_facts.{interface_name}.mtu
+    ``interface_data`` is exposed raw so cmdb_host_interfaces and the
+    dependent address views can each decode what they need directly,
+    instead of joining back to fact_inventory, which under hash
+    partitioning would scan every partition.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_interfaces AS
+    CREATE OR REPLACE VIEW cmdb_host_interfaces_private AS
     SELECT fi.id AS inventory_id
          , fi.client_address
          , fi.updated_at
          , (fi.system_facts ->> 'machine_id') AS machine_id
          , (fi.system_facts ->> 'fqdn') AS fqdn
          , iface_key AS interface_name
-         , (iface_data ->> 'type') AS device_type
-         , NULLIF((iface_data ->> 'macaddress'), '')::macaddr AS mac_address
-         , (iface_data ->> 'active')::boolean AS is_active
-         , (iface_data ->> 'mtu')::integer AS mtu
          , iface_data AS interface_data
       FROM fact_inventory AS fi
      CROSS JOIN LATERAL jsonb_each(fi.system_facts)
            AS ifaces(iface_key, iface_data)
      WHERE iface_data ? 'device'
        AND iface_key IS DISTINCT FROM 'lo'
+    """)
+
+
+def _create_cmdb_host_interfaces() -> None:
+    """Create cmdb_host_interfaces view.
+
+    Public. Decodes basic per-interface metadata from the raw
+    ``interface_data`` JSONB carried by cmdb_host_interfaces_private.
+    ``SELECT *`` and schema introspection (psql \\d, ORM reflection, etc.)
+    show only these decoded columns; the raw JSONB stays in the private view.
+    """
+    op.execute("""
+    CREATE OR REPLACE VIEW cmdb_host_interfaces AS
+    SELECT inventory_id
+         , client_address
+         , updated_at
+         , machine_id
+         , fqdn
+         , interface_name
+         , (interface_data ->> 'type') AS device_type
+         , NULLIF((interface_data ->> 'macaddress'), '')::macaddr AS mac_address
+         , (interface_data ->> 'active')::boolean AS is_active
+         , (interface_data ->> 'mtu')::integer AS mtu
+         , NULLIF((interface_data ->> 'speed'), '')::integer AS link_speed
+         , (interface_data ->> 'module') AS module
+         , (interface_data ->> 'pciid') AS pci_id
+      FROM cmdb_host_interfaces_private
     """)
 
 
@@ -156,8 +184,9 @@ def _create_cmdb_host_interface_ipv4_addresses() -> None:
     Filtering: Excludes 127.0.0.0/8 addresses (loopback already filtered at
     interface level). Preserves NULL addresses for auditing downstream filtering.
 
-    JSON paths:
-      - ipv4 data: system_facts.{interface_name}.ipv4
+    Reads from cmdb_host_interfaces_private (not the public cmdb_host_interfaces
+    view) since it needs the raw interface_data JSONB the public view doesn't
+    carry, decoding device_type/mac_address/is_active from it directly here.
     """
     op.execute("""
     CREATE OR REPLACE VIEW cmdb_host_interface_ipv4_addresses AS
@@ -167,16 +196,16 @@ def _create_cmdb_host_interface_ipv4_addresses() -> None:
          , ci.updated_at
          , ci.fqdn
          , ci.interface_name
-         , ci.device_type
-         , ci.mac_address
-         , ci.is_active
+         , (ci.interface_data ->> 'type') AS device_type
+         , NULLIF((ci.interface_data ->> 'macaddress'), '')::macaddr AS mac_address
+         , (ci.interface_data ->> 'active')::boolean AS is_active
          , addr_inet AS ipv4_cidr
          , host(addr_inet)::inet AS ipv4_address
          , netmask(addr_inet) AS ipv4_netmask
          , masklen(addr_inet)::smallint AS ipv4_prefix
          , network(addr_inet) AS ipv4_network
          , broadcast(addr_inet)::inet AS ipv4_broadcast
-      FROM cmdb_host_interfaces AS ci
+      FROM cmdb_host_interfaces_private AS ci
       LEFT JOIN LATERAL (
         -- Handle structured object: {"address": "...", "prefix": "24", ...}
         SELECT COALESCE(
@@ -218,8 +247,9 @@ def _create_cmdb_host_interface_ipv6_addresses() -> None:
     Filtering: Excludes ::1 address (loopback interface already filtered at
     interface level). Preserves NULL addresses for auditing downstream filtering.
 
-    JSON paths:
-      - ipv6 data: system_facts.{interface_name}.ipv6
+    Reads from cmdb_host_interfaces_private (not the public cmdb_host_interfaces
+    view) since it needs the raw interface_data JSONB the public view doesn't
+    carry, decoding device_type/mac_address/is_active from it directly here.
     """
     op.execute("""
     CREATE OR REPLACE VIEW cmdb_host_interface_ipv6_addresses AS
@@ -229,15 +259,15 @@ def _create_cmdb_host_interface_ipv6_addresses() -> None:
          , ci.machine_id
          , ci.fqdn
          , ci.interface_name
-         , ci.device_type
-         , ci.mac_address
-         , ci.is_active
+         , (ci.interface_data ->> 'type') AS device_type
+         , NULLIF((ci.interface_data ->> 'macaddress'), '')::macaddr AS mac_address
+         , (ci.interface_data ->> 'active')::boolean AS is_active
          , addr_inet AS ipv6_cidr
          , host(addr_inet)::inet AS ipv6_address
          , masklen(addr_inet)::smallint AS ipv6_prefix
          , network(addr_inet) AS ipv6_network
          , scope AS ipv6_scope
-      FROM cmdb_host_interfaces AS ci
+      FROM cmdb_host_interfaces_private AS ci
       LEFT JOIN LATERAL (
         SELECT COALESCE(
                    set_masklen((elem ->> 'address')::inet, (elem ->> 'prefix')::int)
@@ -266,33 +296,6 @@ def _create_cmdb_host_hardware() -> None:
     One row per stored record; because fact_inventory is append-only, a host
     with history contributes one row per submission. Filter on updated_at or
     inventory_id to select a single point in time.
-
-    CPU information:
-      - Manufacturer: extracted from processor array (index 1)
-      - Model name: extracted from processor array (index 2)
-      - Socket count: physical socket count (typically 1)
-      - Core count: physical cores per socket
-      - Thread count: logical vCPUs
-
-    Hardware information:
-      - Product model: e.g., "NUC10i7FNH"
-      - Board model: e.g., "NUC10i7FNB"
-      - Product UUID/serial: hardware identification
-      - Chassis form factor: e.g., "Mini PC", "Desktop", "Laptop", "Server"
-      - System architecture: e.g., "x86_64", "aarch64"
-      - Memory info (RAM in bytes)
-
-    JSON paths:
-      - board_name: system_facts.board_name
-      - product_name: system_facts.product_name
-      - product_uuid: system_facts.product_uuid
-      - product_serial: system_facts.product_serial
-      - form_factor: system_facts.form_factor
-      - machine: system_facts.machine
-      - processor: system_facts.processor
-      - processor_count: system_facts.processor_count
-      - processor_cores: system_facts.processor_cores
-      - processor_vcpus: system_facts.processor_vcpus
     """
     op.execute("""
     CREATE OR REPLACE VIEW cmdb_host_hardware AS
@@ -300,8 +303,10 @@ def _create_cmdb_host_hardware() -> None:
          , fi.client_address
          , fi.updated_at
          , (fi.system_facts ->> 'machine_id') AS machine_id
+         , (fi.system_facts ->> 'board_vendor') AS board_vendor
          , (fi.system_facts ->> 'board_name') AS board_model
          , (fi.system_facts ->> 'product_name') AS product_name
+         , (fi.system_facts ->> 'product_version') AS product_version
          , (fi.system_facts ->> 'product_uuid') AS product_uuid
          , (fi.system_facts ->> 'product_serial') AS product_serial
          , (fi.system_facts ->> 'form_factor') AS chassis_form_factor
@@ -322,22 +327,6 @@ def _create_cmdb_host_storage_devices() -> None:
     Extracts physical and virtual storage device metadata.
     One row per device per stored record. Includes partition metadata as JSONB.
 
-    Device types:
-      - Physical: sda, sdb, nvme0n1 (HDD/SSD)
-      - Virtual: zram0, loop, dm-* (device mapper)
-      - Removable: USB drives, memory cards
-
-    Metadata:
-      - Device name: e.g., "sda"
-      - Model/Vendor/Serial: hardware identification
-      - Size: derived from sectors * sector_size
-      - Virtual: true for device mapper, zram, loop
-      - Removable: true for USB/removable, false for fixed
-      - Fibre: true when a device link identifies Fibre Channel or a
-        NAA-6 WWN
-      - WWN: World Wide Name for device identification
-      - Partitions: aggregated as JSONB
-
     The fact data is inconsistently typed: ``virtual`` arrives as a JSON
     number while ``removable`` arrives as a string. Comparing the ``->>``
     text extraction handles both uniformly.
@@ -349,11 +338,6 @@ def _create_cmdb_host_storage_devices() -> None:
 
     No ORDER BY is defined; a view's ordering is not preserved by an outer
     query, so sorting here would only cost a sort on every access.
-
-    JSON paths:
-      - devices: system_facts.devices
-      - device metadata: system_facts.devices.{device_name}
-      - partitions: system_facts.devices.{device_name}.partitions
     """
     op.execute("""
     CREATE OR REPLACE VIEW cmdb_host_storage_devices AS
@@ -373,6 +357,8 @@ def _create_cmdb_host_storage_devices() -> None:
            AS is_virtual
          , COALESCE((devices.device_data ->> 'removable') = '1', false)
            AS is_removable
+         , COALESCE((devices.device_data ->> 'rotational') = '1', false)
+           AS is_rotational
          , COALESCE(
                EXISTS (
                    SELECT 1
@@ -383,11 +369,6 @@ def _create_cmdb_host_storage_devices() -> None:
                )
              , false
            ) AS is_fibre
-         , CASE
-             WHEN (devices.device_data ? 'partitions')
-                 AND devices.device_data -> 'partitions' != '{}'::jsonb
-             THEN devices.device_data -> 'partitions'
-           END AS partitions
       FROM fact_inventory AS fi
      CROSS JOIN LATERAL jsonb_each(fi.system_facts -> 'devices')
            AS devices(device_name, device_data)
@@ -401,22 +382,6 @@ def _create_cmdb_host_os_info() -> None:
     One row per stored record; because fact_inventory is append-only, a host
     with history contributes one row per submission. Filter on updated_at or
     inventory_id to select a single point in time.
-
-    Operating System Information:
-      - os_name: Distribution name (Fedora, AlmaLinux, RedHat, etc.)
-      - os_version: Full version string from distribution_version field
-
-    Host metadata:
-      - fqdn: Fully qualified domain name
-      - machine_id: systemd machine ID
-      - kernel: Kernel version
-
-    JSON paths:
-      - fqdn: system_facts.fqdn
-      - machine_id: system_facts.machine_id
-      - distribution: system_facts.distribution
-      - distribution_version: system_facts.distribution_version
-      - kernel: system_facts.kernel
     """
     op.execute("""
     CREATE OR REPLACE VIEW cmdb_host_os_info AS
@@ -427,6 +392,7 @@ def _create_cmdb_host_os_info() -> None:
          , (fi.system_facts ->> 'fqdn') AS fqdn
          , (fi.system_facts ->> 'distribution') AS os_name
          , (fi.system_facts ->> 'distribution_version') AS os_version
+         , (fi.system_facts ->> 'os_family') AS os_family
          , (fi.system_facts ->> 'kernel') AS kernel
       FROM fact_inventory AS fi
     """)
