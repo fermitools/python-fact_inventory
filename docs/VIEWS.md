@@ -32,8 +32,9 @@ SELECT DISTINCT ON (client_address) *
 
 All non-loopback network interfaces per host. One row per interface.
 
-**Key columns:** `client_address`, `interface_name`, `device_type`, `mac_address`,
-`is_active`, `mtu`, `last_updated_at`
+**Key columns:** `inventory_id`, `client_address`, `updated_at`, `machine_id`,
+`fqdn`, `interface_name`, `device_type`, `mac_address`, `is_active`, `mtu`,
+`link_speed`, `module`, `pci_id`
 
 ```sql
 -- All active interfaces across hosts
@@ -52,8 +53,10 @@ SELECT DISTINCT client_address
 IPv4 addresses and derived netmask/network info per interface. One row per
 address per interface per stored record. Excludes loopback (127.0.0.0/8).
 
-**Key columns:** `client_address`, `interface_name`, `ipv4_cidr`, `ipv4_address`,
-`ipv4_netmask`, `ipv4_prefix`, `ipv4_network`, `ipv4_broadcast`, `updated_at`
+**Key columns:** `inventory_id`, `client_address`, `machine_id`, `updated_at`,
+`fqdn`, `interface_name`, `device_type`, `mac_address`, `is_active`,
+`ipv4_cidr`, `ipv4_address`, `ipv4_netmask`, `ipv4_prefix`, `ipv4_network`,
+`ipv4_broadcast`
 
 `ipv4_cidr` is the native PostgreSQL `inet` value carrying both address and
 prefix (`131.225.220.34/24`). Every other address column is derived from it,
@@ -83,8 +86,9 @@ SELECT client_address, interface_name, ipv4_address, ipv4_netmask
 IPv6 addresses and prefix info per interface. One row per address per
 interface per stored record. Excludes loopback (::1).
 
-**Key columns:** `client_address`, `interface_name`, `ipv6_cidr`, `ipv6_address`,
-`ipv6_prefix`, `ipv6_network`, `ipv6_scope`, `updated_at`
+**Key columns:** `inventory_id`, `client_address`, `updated_at`, `machine_id`,
+`fqdn`, `interface_name`, `device_type`, `mac_address`, `is_active`,
+`ipv6_cidr`, `ipv6_address`, `ipv6_prefix`, `ipv6_network`, `ipv6_scope`
 
 As with IPv4, `ipv6_cidr` is the native `inet` value (`fe80::.../64`) and the
 other columns are derived from it.
@@ -105,10 +109,11 @@ SELECT client_address, interface_name, ipv6_address, ipv6_prefix
 
 CPU, chassis, and hardware identification metadata. One row per stored record.
 
-**Key columns:** `client_address`, `board_model`, `product_name`, `product_uuid`,
+**Key columns:** `inventory_id`, `client_address`, `updated_at`, `machine_id`,
+`board_vendor`, `board_model`, `product_name`, `product_version`,
+`product_uuid`, `product_serial`, `chassis_form_factor`, `system_arch`,
 `cpu_manufacturer`, `cpu_model_name`, `cpu_socket_count`, `cpu_core_count`,
-`cpu_thread_count`, `ram_bytes`, `chassis_form_factor`, `system_arch`,
-`last_updated_at`
+`cpu_thread_count`, `ram_bytes`
 
 ```sql
 -- Hosts grouped by CPU model
@@ -125,12 +130,11 @@ SELECT client_address, cpu_model_name, cpu_core_count, ram_bytes
 
 ### cmdb_host_storage_devices
 
-Physical and virtual storage devices with partitions as JSONB. One row per
-device per host.
+Physical and virtual storage devices. One row per device per host.
 
-**Key columns:** `client_address`, `device_name`, `device_model`, `device_vendor`,
-`device_size_bytes`, `is_rotational`, `is_virtual`, `is_removable`, `is_fibre`,
-`partitions` (JSONB), `last_updated_at`
+**Key columns:** `inventory_id`, `client_address`, `updated_at`, `machine_id`,
+`device_name`, `device_model`, `device_vendor`, `device_serial`, `device_wwn`,
+`device_size_bytes`, `is_rotational`, `is_virtual`, `is_removable`, `is_fibre`
 
 ```sql
 -- Total storage per host
@@ -151,18 +155,18 @@ SELECT client_address, device_name, device_model, device_size_bytes
 
 Operating system and machine metadata. One row per stored record.
 
-**Key columns:** `client_address`, `fqdn`, `machine_id`, `os_name`,
-`os_major_version`, `os_version`, `os_version_full`, `kernel`, `last_updated_at`
+**Key columns:** `inventory_id`, `client_address`, `updated_at`, `machine_id`,
+`fqdn`, `os_name`, `os_version`, `os_family`, `kernel`
 
 ```sql
 -- Count hosts by OS distribution and version
-SELECT os_version_full, count(*) AS host_count
+SELECT os_version, count(*) AS host_count
   FROM cmdb_host_os_info
- GROUP BY os_version_full
+ GROUP BY os_version
  ORDER BY host_count DESC;
 
 -- Hosts running a specific kernel version
-SELECT client_address, fqdn, os_version_full, kernel
+SELECT client_address, fqdn, os_version, kernel
   FROM cmdb_host_os_info
  WHERE kernel ~ '^6\.1';
 ```
