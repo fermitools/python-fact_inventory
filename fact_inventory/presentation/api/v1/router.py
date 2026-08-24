@@ -14,7 +14,6 @@ from fact_inventory.lib.exceptions import (
     FactValidationError,
 )
 from fact_inventory.lib.settings import Settings, get_settings
-from fact_inventory.presentation.api.v1.controller import FactInventoryController
 from fact_inventory.presentation.api.v1.exception_handlers import (
     fact_payload_too_large_error_handler,
     fact_validation_error_handler,
@@ -22,6 +21,7 @@ from fact_inventory.presentation.api.v1.exception_handlers import (
     sqlalchemy_error_handler,
     timeout_error_handler,
 )
+from fact_inventory.presentation.api.v1.factcontroller import FactInventoryController
 
 __all__ = ["create_v1_router"]
 
