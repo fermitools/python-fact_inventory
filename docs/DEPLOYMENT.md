@@ -347,7 +347,7 @@ The ingress controller strips `/fact_inventory` and forwards to your pod. Your p
 
 ### Service and Deployment manifests
 
-```yaml
+````yaml
 apiVersion: v1
 kind: Service
 metadata:
@@ -389,19 +389,21 @@ spec:
               value: "true"
           livenessProbe:
             httpGet:
-              path: /fact_inventory/health
+              path: /health
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /fact_inventory/ready
+              path: /ready
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
-```
 
-> **Note**: Kubernetes health probes use the _external_ path `/fact_inventory/health`. The ingress strips this before forwarding to your container.
+The container exposes its health and readiness endpoints directly at `/health`
+and `/ready` because APP_PREFIX defaults to `/`. Remote clients use the
+external path `/fact_inventory/health` and `/fact_inventory/ready`; the ingress
+controller or load balancer strips the `/fact_inventory` prefix before forwarding.
 
 ### Metrics Endpoint
 
@@ -442,7 +444,7 @@ app = Litestar(
     route_handlers=[fact_inventory_router, PrometheusController],
     middleware=[prometheus_config.middleware],
 )
-```
+````
 
 > **Important**: When embedding, you pass the prefix directly to `create_router(path="...")`. You do **not** set `APP_NAME`. The `APP_NAME` environment variable only affects standalone deployments.
 

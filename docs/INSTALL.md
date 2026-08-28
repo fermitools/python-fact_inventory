@@ -52,7 +52,7 @@ DATABASE_URI=postgresql+asyncpg://user:password@localhost/dbname
 
 ```bash
 export WEB_CONCURRENCY=8
-DEPLOYMENT=XYZ uvicorn fact_inventory:app_factory --factory --host 0.0.0.0 --port 8000
+DEPLOYMENT=XYZ uvicorn fact_inventory:app_factory --factory --host 0.0.0.0 --port 8000 --workers "$WEB_CONCURRENCY"
 ```
 
 The application is now listening on `http://0.0.0.0:8000/api/v1/facts` with 8 workers.
@@ -221,6 +221,9 @@ Wants=postgresql.service
 
 [Service]
 Type=notify
+# Note: Uvicorn sends SYS_READY on startup when Type=notify is used.
+# Monitor with: systemctl is-active fact-inventory
+# or enable health endpoint with: ENABLE_HEALTH_ENDPOINT=true
 User=fact_inventory
 Group=fact_inventory
 WorkingDirectory=/opt/fact_inventory
