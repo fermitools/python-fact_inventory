@@ -9,7 +9,7 @@ host, network, hardware, and OS data from fact_inventory JSONB columns:
 Network views:
   1. cmdb_host_interfaces_private: Private. Join keys and raw interface
      JSONB only. Not for direct use; see cmdb_host_interfaces.
-  2. cmdb_host_interfaces: Public. All interfaces with basic metadata.
+  2. cmdb_host_interfaces: All interfaces with basic metadata.
   3. cmdb_host_interface_ipv4_addresses: IPv4 addresses per interface
   4. cmdb_host_interface_ipv6_addresses: IPv6 addresses per interface
 
@@ -20,12 +20,31 @@ Hardware views:
 OS view:
   7. cmdb_host_os_info: Operating system metadata (kernel, distribution)
 
-All extracted columns are documented with JSON path references in the
-per-view docstrings below.
+All extracted columns are documented with JSON path references and PostgreSQL
+column types in the per-view docstrings below.
 
-Views hold no data, so this revision is non-destructive in both directions.
-Because every view is created with CREATE OR REPLACE, re-running the upgrade
-over an existing set is also safe.
+View dependencies
+-----------------
+cmdb_host_interfaces_private is the only view that reads directly from
+fact_inventory. The public interface view and both address views select from it
+so they can decode only the fields they need without rescanning every hash
+partition of fact_inventory. This means:
+
+  - Drop order must be reverse of creation order (dependent views first).
+  - Altering the column signature of cmdb_host_interfaces_private requires
+    dropping and recreating every view that selects from it.
+
+Idempotency and safety
+----------------------
+All views are created with ``CREATE OR REPLACE VIEW``. The upgrade is
+non-destructive: views hold no data, and re-running upgrade over an existing
+set simply replaces the view definitions. Downgrade drops views in reverse
+creation order so dependent views are removed before their dependencies.
+
+Because ``CREATE OR REPLACE VIEW`` cannot change the number or types of output
+columns for an existing view that other views depend on, a schema change that
+modifies the public signature of cmdb_host_interfaces_private must first drop
+all dependent views, replace the private view, and then recreate dependents.
 """
 
 from alembic import op
@@ -93,8 +112,8 @@ def downgrade() -> None:
 def _create_cmdb_host_interfaces_private() -> None:
     """Create cmdb_host_interfaces_private view.
 
-    Private. Not for direct use - see cmdb_host_interfaces for the
-    public-facing view over this data.
+    Private - Not for direct use!
+    See cmdb_host_interfaces for the public-facing view over this data.
 
     Extracts all non-loopback interfaces from system_facts JSONB.
     One row per interface per stored record. Carries only join/identifying
@@ -111,6 +130,15 @@ def _create_cmdb_host_interfaces_private() -> None:
     dependent address views can each decode what they need directly,
     instead of joining back to fact_inventory, which under hash
     partitioning would scan every partition.
+
+    Columns:
+      inventory_id   bigint           fact_inventory.id
+      client_address inet             fact_inventory.client_address
+      updated_at     timestamptz      fact_inventory.updated_at
+      interface_name text             key from jsonb_each(system_facts)
+      interface_data jsonb            value from jsonb_each(system_facts)
+      machine_id     text             system_facts ->> 'machine_id'
+      fqdn           text             system_facts ->> 'fqdn'
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_interfaces_private AS
@@ -133,10 +161,25 @@ WHERE
 def _create_cmdb_host_interfaces() -> None:
     """Create cmdb_host_interfaces view.
 
-    Public. Decodes basic per-interface metadata from the raw
+    Decodes basic per-interface metadata from the raw
     ``interface_data`` JSONB carried by cmdb_host_interfaces_private.
     ``SELECT *`` and schema introspection (psql \\d, ORM reflection, etc.)
     show only these decoded columns; the raw JSONB stays in the private view.
+
+    Columns:
+      inventory_id   bigint     inherited from cmdb_host_interfaces_private
+      client_address inet       inherited from cmdb_host_interfaces_private
+      updated_at     timestamptz inherited from cmdb_host_interfaces_private
+      machine_id     text       system_facts ->> 'machine_id'
+      fqdn           text       system_facts ->> 'fqdn'
+      interface_name text       system_facts key for this interface
+      device_type    text       interface_data ->> 'type'
+      mac_address    macaddr    interface_data ->> 'macaddress'
+      is_active      boolean    interface_data ->> 'active' (text-normalized)
+      mtu            integer    interface_data ->> 'mtu'
+      link_speed     integer    interface_data ->> 'speed'
+      module         text       interface_data ->> 'module'
+      pci_id         text       interface_data ->> 'pciid'
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_interfaces AS
@@ -202,6 +245,23 @@ def _create_cmdb_host_interface_ipv4_addresses() -> None:
     Reads from cmdb_host_interfaces_private (not the public cmdb_host_interfaces
     view) since it needs the raw interface_data JSONB the public view doesn't
     carry, decoding device_type/mac_address/is_active from it directly here.
+
+    Columns:
+      inventory_id     bigint     inherited from cmdb_host_interfaces_private
+      client_address   inet       inherited from cmdb_host_interfaces_private
+      machine_id       text       system_facts ->> 'machine_id'
+      updated_at       timestamptz inherited from cmdb_host_interfaces_private
+      fqdn             text       system_facts ->> 'fqdn'
+      interface_name   text       system_facts key for this interface
+      ipv4_cidr        inet       interface_data -> 'ipv4' recombined address/prefix
+      device_type      text       interface_data ->> 'type'
+      mac_address      macaddr    interface_data ->> 'macaddress'
+      is_active        boolean    interface_data ->> 'active' (text-normalized)
+      ipv4_address     inet       HOST(ipv4_cidr) cast back to inet
+      ipv4_netmask     inet       NETMASK(ipv4_cidr)
+      ipv4_prefix      smallint   MASKLEN(ipv4_cidr)
+      ipv4_network     inet       NETWORK(ipv4_cidr)
+      ipv4_broadcast   inet       BROADCAST(ipv4_cidr)
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_interface_ipv4_addresses AS
@@ -235,12 +295,14 @@ WITH addr_subquery AS (
         WHERE JSONB_TYPEOF(ci.interface_data -> 'ipv4') = 'object'
         UNION ALL
         SELECT
+            NULLIF(elem, '')::inet AS addr_inet
+        FROM JSONB_ARRAY_ELEMENTS_TEXT(
             CASE
-                WHEN JSONB_ARRAY_ELEMENTS_TEXT(ci.interface_data -> 'ipv4') = ''
-                    THEN NULL
-                ELSE JSONB_ARRAY_ELEMENTS_TEXT(ci.interface_data -> 'ipv4')::inet
-            END AS addr_inet
-        WHERE JSONB_TYPEOF(ci.interface_data -> 'ipv4') = 'array'
+                WHEN JSONB_TYPEOF(ci.interface_data -> 'ipv4') = 'array'
+                    THEN ci.interface_data -> 'ipv4'
+                ELSE '[]'::jsonb
+            END
+        ) AS elem
     ) AS addr ON TRUE
     WHERE
         addr.addr_inet IS NULL
@@ -325,6 +387,22 @@ def _create_cmdb_host_interface_ipv6_addresses() -> None:
     Reads from cmdb_host_interfaces_private (not the public cmdb_host_interfaces
     view) since it needs the raw interface_data JSONB the public view doesn't
     carry, decoding device_type/mac_address/is_active from it directly here.
+
+    Columns:
+      inventory_id     bigint     inherited from cmdb_host_interfaces_private
+      client_address   inet       inherited from cmdb_host_interfaces_private
+      updated_at       timestamptz inherited from cmdb_host_interfaces_private
+      machine_id       text       system_facts ->> 'machine_id'
+      fqdn             text       system_facts ->> 'fqdn'
+      interface_name   text       system_facts key for this interface
+      ipv6_cidr        inet       interface_data -> 'ipv6' recombined address/prefix
+      ipv6_scope       text       interface_data -> 'ipv6' ->> 'scope'
+      device_type      text       interface_data ->> 'type'
+      mac_address      macaddr    interface_data ->> 'macaddress'
+      is_active        boolean    interface_data ->> 'active' (text-normalized)
+      ipv6_address     inet       HOST(ipv6_cidr) cast back to inet
+      ipv6_prefix      smallint   MASKLEN(ipv6_cidr)
+      ipv6_network     inet       NETWORK(ipv6_cidr)
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_interface_ipv6_addresses AS
@@ -423,6 +501,26 @@ def _create_cmdb_host_hardware() -> None:
 
     This view is robust against malformed JSON: missing numeric fields are
     returned as NULL instead of throwing SQL errors.
+
+    Columns:
+      inventory_id      bigint    fact_inventory.id
+      client_address    inet      fact_inventory.client_address
+      updated_at        timestamptz fact_inventory.updated_at
+      machine_id        text      system_facts ->> 'machine_id'
+      board_vendor      text      system_facts ->> 'board_vendor'
+      board_model       text      system_facts ->> 'board_name'
+      product_name      text      system_facts ->> 'product_name'
+      product_version   text      system_facts ->> 'product_version'
+      product_uuid      text      system_facts ->> 'product_uuid'
+      product_serial    text      system_facts ->> 'product_serial'
+      chassis_form_factor text    system_facts ->> 'form_factor'
+      system_arch       text      system_facts ->> 'machine'
+      cpu_manufacturer  text      system_facts -> 'processor' ->> 1
+      cpu_model_name    text      system_facts -> 'processor' ->> 2
+      cpu_socket_count  integer   system_facts ->> 'processor_count'
+      cpu_core_count    integer   system_facts ->> 'processor_cores'
+      cpu_thread_count  integer   system_facts ->> 'processor_vcpus'
+      ram_bytes         bigint    system_facts ->> 'memtotal_mb' * 1048576
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_hardware AS
@@ -470,6 +568,22 @@ def _create_cmdb_host_storage_devices() -> None:
 
     No ORDER BY is defined; a view's ordering is not preserved by an outer
     query, so sorting here would only cost a sort on every access.
+
+    Columns:
+      inventory_id      bigint    fact_inventory.id
+      client_address    inet      fact_inventory.client_address
+      updated_at        timestamptz fact_inventory.updated_at
+      device_name       text      key from jsonb_each(system_facts -> 'devices')
+      machine_id        text      system_facts ->> 'machine_id'
+      device_model      text      device_data ->> 'model'
+      device_vendor     text      device_data ->> 'vendor'
+      device_serial     text      device_data ->> 'serial'
+      device_wwn        text      device_data ->> 'wwn'
+      device_size_bytes bigint    device_data ->> 'sectors' * 'sectorsize'
+      is_virtual        boolean   device_data ->> 'virtual' = '1'
+      is_removable      boolean   device_data ->> 'removable' = '1'
+      is_rotational     boolean   device_data ->> 'rotational' = '1'
+      is_fibre          boolean   any links.ids entry matches ^(fc-|wwn-0x6)
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_storage_devices AS
@@ -516,6 +630,17 @@ def _create_cmdb_host_os_info() -> None:
     One row per stored record; because fact_inventory is append-only, a host
     with history contributes one row per submission. Filter on updated_at or
     inventory_id to select a single point in time.
+
+    Columns:
+      inventory_id      bigint    fact_inventory.id
+      client_address    inet      fact_inventory.client_address
+      updated_at        timestamptz fact_inventory.updated_at
+      machine_id        text      system_facts ->> 'machine_id'
+      fqdn              text      system_facts ->> 'fqdn'
+      os_name           text      system_facts ->> 'distribution'
+      os_version        text      system_facts ->> 'distribution_version'
+      os_family         text      system_facts ->> 'os_family'
+      kernel            text      system_facts ->> 'kernel'
     """
     op.execute("""
 CREATE OR REPLACE VIEW cmdb_host_os_info AS
