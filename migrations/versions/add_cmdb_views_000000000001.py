@@ -113,19 +113,20 @@ def _create_cmdb_host_interfaces_private() -> None:
     partitioning would scan every partition.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_interfaces_private AS
-    SELECT fi.id AS inventory_id
-         , fi.client_address
-         , fi.updated_at
-         , (fi.system_facts ->> 'machine_id') AS machine_id
-         , (fi.system_facts ->> 'fqdn') AS fqdn
-         , iface_key AS interface_name
-         , iface_data AS interface_data
-      FROM fact_inventory AS fi
-     CROSS JOIN LATERAL jsonb_each(fi.system_facts)
-           AS ifaces(iface_key, iface_data)
-     WHERE iface_data ? 'device'
-       AND iface_key IS DISTINCT FROM 'lo'
+CREATE OR REPLACE VIEW cmdb_host_interfaces_private AS
+SELECT
+      fi.id AS inventory_id
+    , fi.client_address
+    , fi.updated_at
+    , iface_key AS interface_name
+    , iface_data AS interface_data
+    , (fi.system_facts ->> 'machine_id') AS machine_id
+    , (fi.system_facts ->> 'fqdn') AS fqdn
+FROM fact_inventory AS fi
+CROSS JOIN LATERAL jsonb_each(fi.system_facts)
+WHERE
+    iface_data ? 'device'
+    AND iface_key IS DISTINCT FROM 'lo'
     """)
 
 
@@ -138,21 +139,33 @@ def _create_cmdb_host_interfaces() -> None:
     show only these decoded columns; the raw JSONB stays in the private view.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_interfaces AS
-    SELECT inventory_id
-         , client_address
-         , updated_at
-         , machine_id
-         , fqdn
-         , interface_name
-         , (interface_data ->> 'type') AS device_type
-         , NULLIF((interface_data ->> 'macaddress'), '')::macaddr AS mac_address
-         , (interface_data ->> 'active')::boolean AS is_active
-         , (interface_data ->> 'mtu')::integer AS mtu
-         , NULLIF((interface_data ->> 'speed'), '')::integer AS link_speed
-         , (interface_data ->> 'module') AS module
-         , (interface_data ->> 'pciid') AS pci_id
-      FROM cmdb_host_interfaces_private
+CREATE OR REPLACE VIEW cmdb_host_interfaces AS
+SELECT
+      inventory_id
+    , client_address
+    , updated_at
+    , machine_id
+    , fqdn
+    , interface_name
+    , (interface_data ->> 'type') AS device_type
+    , CASE
+        WHEN NULLIF(interface_data ->> 'macaddress', '') IS NULL
+            THEN NULL
+        ELSE NULLIF(interface_data ->> 'macaddress', '')::macaddr
+    END AS mac_address
+    , CASE
+        WHEN interface_data ->> 'active' IS NULL
+            THEN NULL
+        WHEN LOWER(interface_data ->> 'active') IN ('true', 't', 'yes', 'y', '1')
+            THEN TRUE
+        WHEN LOWER(interface_data ->> 'active') IN ('false', 'f', 'no', 'n', '0')
+            THEN FALSE
+    END AS is_active
+    , NULLIF(NULLIF(interface_data ->> 'mtu', ''), 'NULL')::integer AS mtu
+    , NULLIF(NULLIF(interface_data ->> 'speed', ''), 'NULL')::integer AS link_speed
+    , (interface_data ->> 'module') AS module
+    , (interface_data ->> 'pciid') AS pci_id
+FROM cmdb_host_interfaces_private
     """)
 
 
@@ -176,10 +189,12 @@ def _create_cmdb_host_interface_ipv4_addresses() -> None:
 
     Every other column is then derived from that one value using the built-in
     inet accessors, rather than reading the redundant netmask/network/
-    broadcast fields the facts also provide. set_masklen is STRICT, so when
-    no prefix is present it returns NULL and the COALESCE falls back to the
-    plain cast - which is what the string form needs, since there the prefix
-    may be embedded in the value ("10.0.0.0/24") or absent entirely.
+    broadcast fields the facts also provide. When prefix is missing or empty,
+    the address is cast directly to inet without set_masklen.
+
+    This view is robust against malformed JSON: missing fields, empty strings,
+    and invalid IP addresses are handled gracefully with NULL values instead
+    of throwing SQL errors.
 
     Filtering: Excludes 127.0.0.0/8 addresses (loopback already filtered at
     interface level). Preserves NULL addresses for auditing downstream filtering.
@@ -189,40 +204,86 @@ def _create_cmdb_host_interface_ipv4_addresses() -> None:
     carry, decoding device_type/mac_address/is_active from it directly here.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_interface_ipv4_addresses AS
-    SELECT ci.inventory_id
-         , ci.client_address
-         , ci.machine_id
-         , ci.updated_at
-         , ci.fqdn
-         , ci.interface_name
-         , (ci.interface_data ->> 'type') AS device_type
-         , NULLIF((ci.interface_data ->> 'macaddress'), '')::macaddr AS mac_address
-         , (ci.interface_data ->> 'active')::boolean AS is_active
-         , addr_inet AS ipv4_cidr
-         , host(addr_inet)::inet AS ipv4_address
-         , netmask(addr_inet) AS ipv4_netmask
-         , masklen(addr_inet)::smallint AS ipv4_prefix
-         , network(addr_inet) AS ipv4_network
-         , broadcast(addr_inet)::inet AS ipv4_broadcast
-      FROM cmdb_host_interfaces_private AS ci
-      LEFT JOIN LATERAL (
-        -- Handle structured object: {"address": "...", "prefix": "24", ...}
-        SELECT COALESCE(
-                   set_masklen(
-                       (ci.interface_data -> 'ipv4' ->> 'address')::inet
-                     , (ci.interface_data -> 'ipv4' ->> 'prefix')::int
-                   )
-                 , (ci.interface_data -> 'ipv4' ->> 'address')::inet
-               ) AS addr_inet
-         WHERE jsonb_typeof(ci.interface_data -> 'ipv4') = 'object'
-        UNION ALL
-        -- Handle array of strings: ["10.0.0.1", "10.0.0.0/24", ...]
-        SELECT jsonb_array_elements_text(ci.interface_data -> 'ipv4')::inet
-         WHERE jsonb_typeof(ci.interface_data -> 'ipv4') = 'array'
-    ) AS addr ON TRUE
-     WHERE addr_inet IS NULL
-        OR NOT (addr_inet << inet '127.0.0.0/8')
+CREATE OR REPLACE VIEW cmdb_host_interface_ipv4_addresses AS
+SELECT
+      ci.inventory_id
+    , ci.client_address
+    , ci.machine_id
+    , ci.updated_at
+    , ci.fqdn
+    , ci.interface_name
+    , addr_inet AS ipv4_cidr
+    , (ci.interface_data ->> 'type') AS device_type
+    , CASE
+        WHEN NULLIF(ci.interface_data ->> 'macaddress', '') IS NULL
+            THEN NULL
+        ELSE NULLIF(ci.interface_data ->> 'macaddress', '')::macaddr
+    END AS mac_address
+    , CASE
+        WHEN ci.interface_data ->> 'active' IS NULL
+            THEN NULL
+        WHEN LOWER(ci.interface_data ->> 'active') IN ('true', 't', 'yes', 'y', '1')
+            THEN TRUE
+        WHEN LOWER(ci.interface_data ->> 'active') IN ('false', 'f', 'no', 'n', '0')
+            THEN FALSE
+    END AS is_active
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE HOST(addr_inet)::inet
+    END AS ipv4_address
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE NETMASK(addr_inet)
+    END AS ipv4_netmask
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE MASKLEN(addr_inet)::smallint
+    END AS ipv4_prefix
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE NETWORK(addr_inet)
+    END AS ipv4_network
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE BROADCAST(addr_inet)::inet
+    END AS ipv4_broadcast
+FROM cmdb_host_interfaces_private AS ci
+LEFT JOIN LATERAL (
+    -- Handle structured object: {"address": "...", "prefix": "24", ...}
+    SELECT
+        CASE
+            WHEN ci.interface_data -> 'ipv4' ->> 'address' IS NULL
+                THEN NULL
+            WHEN ci.interface_data -> 'ipv4' ->> 'address' = ''
+                THEN NULL
+            WHEN
+                ci.interface_data -> 'ipv4' ->> 'prefix' IS NULL
+                OR ci.interface_data -> 'ipv4' ->> 'prefix' = ''
+                THEN (ci.interface_data -> 'ipv4' ->> 'address')::inet
+            ELSE SET_MASKLEN(
+                (ci.interface_data -> 'ipv4' ->> 'address')::inet
+                , NULLIF(ci.interface_data -> 'ipv4' ->> 'prefix', '')::int
+            )
+        END AS addr_inet
+    WHERE JSONB_TYPEOF(ci.interface_data -> 'ipv4') = 'object'
+    UNION ALL
+    -- Handle array of strings: ["10.0.0.1", "10.0.0.0/24", ...]
+    SELECT
+        CASE
+            WHEN JSONB_ARRAY_ELEMENTS_TEXT(ci.interface_data -> 'ipv4') = ''
+                THEN NULL
+            ELSE JSONB_ARRAY_ELEMENTS_TEXT(ci.interface_data -> 'ipv4')::inet
+        END
+    WHERE JSONB_TYPEOF(ci.interface_data -> 'ipv4') = 'array'
+) AS addr ON TRUE
+WHERE
+    addr_inet IS NULL
+    OR NOT (addr_inet << inet '127.0.0.0/8')
     """)
 
 
@@ -239,7 +300,11 @@ def _create_cmdb_host_interface_ipv6_addresses() -> None:
     As with IPv4, ``address`` in the object form carries no prefix, so it is
     recombined with the sibling ``prefix`` field into a single native ``inet``
     value via set_masklen() and every other column is derived from that.
-    set_masklen is STRICT, so a missing prefix falls back to the plain cast.
+    When prefix is missing or empty, the address is cast directly to inet.
+
+    This view is robust against malformed JSON: missing fields, empty strings,
+    and invalid IP addresses are handled gracefully with NULL values instead
+    of throwing SQL errors.
 
     Both shapes are arrays, so the two branches are distinguished by the
     element type rather than the container type.
@@ -252,40 +317,89 @@ def _create_cmdb_host_interface_ipv6_addresses() -> None:
     carry, decoding device_type/mac_address/is_active from it directly here.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_interface_ipv6_addresses AS
-    SELECT ci.inventory_id
-         , ci.client_address
-         , ci.updated_at
-         , ci.machine_id
-         , ci.fqdn
-         , ci.interface_name
-         , (ci.interface_data ->> 'type') AS device_type
-         , NULLIF((ci.interface_data ->> 'macaddress'), '')::macaddr AS mac_address
-         , (ci.interface_data ->> 'active')::boolean AS is_active
-         , addr_inet AS ipv6_cidr
-         , host(addr_inet)::inet AS ipv6_address
-         , masklen(addr_inet)::smallint AS ipv6_prefix
-         , network(addr_inet) AS ipv6_network
-         , scope AS ipv6_scope
-      FROM cmdb_host_interfaces_private AS ci
-      LEFT JOIN LATERAL (
-        SELECT COALESCE(
-                   set_masklen((elem ->> 'address')::inet, (elem ->> 'prefix')::int)
-                 , (elem ->> 'address')::inet
-               ) AS addr_inet
-             , (elem ->> 'scope') AS scope
-          FROM jsonb_array_elements(ci.interface_data -> 'ipv6') AS elem
-         WHERE jsonb_typeof(ci.interface_data -> 'ipv6') = 'array'
-           AND jsonb_typeof(elem) = 'object'
-        UNION ALL
-        SELECT (elem #>> '{}')::inet
-             , NULL
-          FROM jsonb_array_elements(ci.interface_data -> 'ipv6') AS elem
-         WHERE jsonb_typeof(ci.interface_data -> 'ipv6') = 'array'
-           AND jsonb_typeof(elem) = 'string'
-      ) AS addr ON TRUE
-     WHERE addr_inet IS NULL
-        OR host(addr_inet)::inet IS DISTINCT FROM inet '::1'
+CREATE OR REPLACE VIEW cmdb_host_interface_ipv6_addresses AS
+SELECT
+      ci.inventory_id
+    , ci.client_address
+    , ci.updated_at
+    , ci.machine_id
+    , ci.fqdn
+    , ci.interface_name
+    , addr_inet AS ipv6_cidr
+    , scope AS ipv6_scope
+    , (ci.interface_data ->> 'type') AS device_type
+    , CASE
+        WHEN NULLIF(ci.interface_data ->> 'macaddress', '') IS NULL
+            THEN NULL
+        ELSE NULLIF(ci.interface_data ->> 'macaddress', '')::macaddr
+    END AS mac_address
+    , CASE
+        WHEN ci.interface_data ->> 'active' IS NULL
+            THEN NULL
+        WHEN LOWER(ci.interface_data ->> 'active') IN ('true', 't', 'yes', 'y', '1')
+            THEN TRUE
+        WHEN LOWER(ci.interface_data ->> 'active') IN ('false', 'f', 'no', 'n', '0')
+            THEN FALSE
+    END AS is_active
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE HOST(addr_inet)::inet
+    END AS ipv6_address
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE MASKLEN(addr_inet)::smallint
+    END AS ipv6_prefix
+    , CASE
+        WHEN addr_inet IS NULL
+            THEN NULL
+        ELSE NETWORK(addr_inet)
+    END AS ipv6_network
+FROM cmdb_host_interfaces_private AS ci
+LEFT JOIN LATERAL (
+    SELECT
+        CASE
+            WHEN
+                elem ->> 'address' IS NULL
+                OR elem ->> 'address' = ''
+                THEN NULL
+            WHEN
+                elem ->> 'prefix' IS NULL
+                OR elem ->> 'prefix' = ''
+                THEN (elem ->> 'address')::inet
+            ELSE SET_MASKLEN(
+                (elem ->> 'address')::inet
+                , NULLIF(elem ->> 'prefix', '')::int
+            )
+        END AS addr_inet
+        , CASE
+            WHEN
+                elem ->> 'scope' IS NULL
+                OR elem ->> 'scope' = ''
+                THEN NULL
+            ELSE elem ->> 'scope'
+        END AS scope
+    FROM JSONB_ARRAY_ELEMENTS(ci.interface_data -> 'ipv6') AS elem
+    WHERE
+        JSONB_TYPEOF(ci.interface_data -> 'ipv6') = 'array'
+        AND JSONB_TYPEOF(elem) = 'object'
+    UNION ALL
+    SELECT
+        CASE
+            WHEN (elem #>> '{}') = ''
+                THEN NULL
+            ELSE (elem #>> '{}')::inet
+        END
+        , NULL
+    FROM JSONB_ARRAY_ELEMENTS(ci.interface_data -> 'ipv6') AS elem
+    WHERE
+        JSONB_TYPEOF(ci.interface_data -> 'ipv6') = 'array'
+        AND JSONB_TYPEOF(elem) = 'string'
+) AS addr ON TRUE
+WHERE
+    addr_inet IS NULL
+    OR HOST(addr_inet)::inet IS DISTINCT FROM inet '::1'
     """)
 
 
@@ -296,28 +410,36 @@ def _create_cmdb_host_hardware() -> None:
     One row per stored record; because fact_inventory is append-only, a host
     with history contributes one row per submission. Filter on updated_at or
     inventory_id to select a single point in time.
+
+    This view is robust against malformed JSON: missing numeric fields are
+    returned as NULL instead of throwing SQL errors.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_hardware AS
-    SELECT fi.id AS inventory_id
-         , fi.client_address
-         , fi.updated_at
-         , (fi.system_facts ->> 'machine_id') AS machine_id
-         , (fi.system_facts ->> 'board_vendor') AS board_vendor
-         , (fi.system_facts ->> 'board_name') AS board_model
-         , (fi.system_facts ->> 'product_name') AS product_name
-         , (fi.system_facts ->> 'product_version') AS product_version
-         , (fi.system_facts ->> 'product_uuid') AS product_uuid
-         , (fi.system_facts ->> 'product_serial') AS product_serial
-         , (fi.system_facts ->> 'form_factor') AS chassis_form_factor
-         , (fi.system_facts ->> 'machine') AS system_arch
-         , (fi.system_facts -> 'processor' ->> 1) AS cpu_manufacturer
-         , (fi.system_facts -> 'processor' ->> 2) AS cpu_model_name
-         , (fi.system_facts ->> 'processor_count')::integer AS cpu_socket_count
-         , (fi.system_facts ->> 'processor_cores')::integer AS cpu_core_count
-         , (fi.system_facts ->> 'processor_vcpus')::integer AS cpu_thread_count
-         , ((fi.system_facts ->> 'memtotal_mb')::bigint * 1048576) AS ram_bytes
-      FROM fact_inventory AS fi
+CREATE OR REPLACE VIEW cmdb_host_hardware AS
+SELECT
+      fi.id AS inventory_id
+    , fi.client_address
+    , fi.updated_at
+    , (fi.system_facts ->> 'machine_id') AS machine_id
+    , (fi.system_facts ->> 'board_vendor') AS board_vendor
+    , (fi.system_facts ->> 'board_name') AS board_model
+    , (fi.system_facts ->> 'product_name') AS product_name
+    , (fi.system_facts ->> 'product_version') AS product_version
+    , (fi.system_facts ->> 'product_uuid') AS product_uuid
+    , (fi.system_facts ->> 'product_serial') AS product_serial
+    , (fi.system_facts ->> 'form_factor') AS chassis_form_factor
+    , (fi.system_facts ->> 'machine') AS system_arch
+    , (fi.system_facts -> 'processor' ->> 1) AS cpu_manufacturer
+    , (fi.system_facts -> 'processor' ->> 2) AS cpu_model_name
+    , NULLIF(NULLIF(fi.system_facts ->> 'processor_count', ''), 'NULL')::integer
+        AS cpu_socket_count
+    , NULLIF(NULLIF(fi.system_facts ->> 'processor_cores', ''), 'NULL')::integer
+        AS cpu_core_count
+    , NULLIF(NULLIF(fi.system_facts ->> 'processor_vcpus', ''), 'NULL')::integer
+        AS cpu_thread_count
+    , NULLIF(NULLIF(fi.system_facts ->> 'memtotal_mb', ''), 'NULL')::bigint * 1048576
+        AS ram_bytes
+FROM fact_inventory AS fi
     """)
 
 
@@ -340,38 +462,40 @@ def _create_cmdb_host_storage_devices() -> None:
     query, so sorting here would only cost a sort on every access.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_storage_devices AS
-    SELECT fi.id AS inventory_id
-         , fi.client_address
-         , fi.updated_at
-         , (fi.system_facts ->> 'machine_id') AS machine_id
-         , devices.device_name
-         , (devices.device_data ->> 'model') AS device_model
-         , (devices.device_data ->> 'vendor') AS device_vendor
-         , (devices.device_data ->> 'serial') AS device_serial
-         , (devices.device_data ->> 'wwn') AS device_wwn
-         , (devices.device_data ->> 'sectors')::bigint
-           * (devices.device_data ->> 'sectorsize')::bigint
-           AS device_size_bytes
-         , COALESCE((devices.device_data ->> 'virtual') = '1', false)
-           AS is_virtual
-         , COALESCE((devices.device_data ->> 'removable') = '1', false)
-           AS is_removable
-         , COALESCE((devices.device_data ->> 'rotational') = '1', false)
-           AS is_rotational
-         , COALESCE(
-               EXISTS (
-                   SELECT 1
-                     FROM jsonb_array_elements_text(
-                              devices.device_data -> 'links' -> 'ids'
-                          ) AS link_id
-                    WHERE link_id ~ '^(fc-|wwn-0x6)'
-               )
-             , false
-           ) AS is_fibre
-      FROM fact_inventory AS fi
-     CROSS JOIN LATERAL jsonb_each(fi.system_facts -> 'devices')
-           AS devices(device_name, device_data)
+CREATE OR REPLACE VIEW cmdb_host_storage_devices AS
+SELECT
+      fi.id AS inventory_id
+    , fi.client_address
+    , fi.updated_at
+    , devices.device_name
+    , (fi.system_facts ->> 'machine_id') AS machine_id
+    , (devices.device_data ->> 'model') AS device_model
+    , (devices.device_data ->> 'vendor') AS device_vendor
+    , (devices.device_data ->> 'serial') AS device_serial
+    , (devices.device_data ->> 'wwn') AS device_wwn
+    , NULLIF(NULLIF(devices.device_data ->> 'sectors', ''), 'NULL')::bigint
+    * NULLIF(NULLIF(devices.device_data ->> 'sectorsize', ''), 'NULL')::bigint
+        AS device_size_bytes
+    , COALESCE(NULLIF(devices.device_data ->> 'virtual', '') = '1', FALSE)
+        AS is_virtual
+    , COALESCE(NULLIF(devices.device_data ->> 'removable', '') = '1', FALSE)
+        AS is_removable
+    , COALESCE(NULLIF(devices.device_data ->> 'rotational', '') = '1', FALSE)
+        AS is_rotational
+    , COALESCE(
+        EXISTS (
+            SELECT 1
+            FROM
+                JSONB_ARRAY_ELEMENTS_TEXT(
+                    devices.device_data -> 'links' -> 'ids'
+                ) AS link_id
+            WHERE link_id ~ '^(fc-|wwn-0x6)'
+        )
+        , FALSE
+    ) AS is_fibre
+FROM fact_inventory AS fi
+CROSS JOIN LATERAL JSONB_EACH(fi.system_facts -> 'devices')
+    AS devices (device_name, device_data)
     """)
 
 
@@ -384,15 +508,16 @@ def _create_cmdb_host_os_info() -> None:
     inventory_id to select a single point in time.
     """
     op.execute("""
-    CREATE OR REPLACE VIEW cmdb_host_os_info AS
-    SELECT fi.id AS inventory_id
-         , fi.client_address
-         , fi.updated_at
-         , (fi.system_facts ->> 'machine_id') AS machine_id
-         , (fi.system_facts ->> 'fqdn') AS fqdn
-         , (fi.system_facts ->> 'distribution') AS os_name
-         , (fi.system_facts ->> 'distribution_version') AS os_version
-         , (fi.system_facts ->> 'os_family') AS os_family
-         , (fi.system_facts ->> 'kernel') AS kernel
-      FROM fact_inventory AS fi
+CREATE OR REPLACE VIEW cmdb_host_os_info AS
+SELECT
+    fi.id AS inventory_id
+    , fi.client_address
+    , fi.updated_at
+    , (fi.system_facts ->> 'machine_id') AS machine_id
+    , (fi.system_facts ->> 'fqdn') AS fqdn
+    , (fi.system_facts ->> 'distribution') AS os_name
+    , (fi.system_facts ->> 'distribution_version') AS os_version
+    , (fi.system_facts ->> 'os_family') AS os_family
+    , (fi.system_facts ->> 'kernel') AS kernel
+FROM fact_inventory AS fi
     """)
