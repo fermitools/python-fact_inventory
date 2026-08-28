@@ -262,7 +262,14 @@ A held lock is one row. Releasing deletes the row.
    the job is skipped.
 3. **Heartbeat.** While work runs, a task refreshes `acquired_at` every
    `interval_seconds / 2`, so a long job is never mistaken for a dead one.
-4. **Release.** A `finally` block deletes the row.
+   The heartbeat shares an event with the work task; if it discovers the lock
+   was taken over, or if it cannot refresh for longer than the stale-lock
+   window, it signals lease loss.
+4. **Work cancellation.** The work coroutine runs as a task. On lease loss the
+   task is cancelled and `run_exclusive_background_job()` raises
+   `BackgroundJobLeaseLostError`. This prevents the old worker from continuing
+   cleanup after another worker has taken over.
+5. **Release.** A `finally` block deletes the row owned by this worker's token.
 
 #### Owner Token Fencing
 
@@ -275,15 +282,18 @@ takeover reused the existing token, the stalled worker would resume holding a
 still-valid credential and its heartbeat would keep refreshing a lock it no
 longer owns - two workers running concurrently, which is what the lock exists
 to prevent. Because takeover issues a new token, the stalled worker's next
-refresh matches no row, returns `None`, and it logs the loss and stands down.
-Its release is likewise a no-op and cannot delete the replacement's lock.
+refresh matches no row, returns `None`, and it signals lease loss. The active
+work task is cancelled, the worker raises `BackgroundJobLeaseLostError`, and
+its release becomes a no-op that cannot delete the replacement's lock.
 
 #### Failure Handling
 
 - Lock unavailable: job logs and returns `0`; no work is done.
-- Heartbeat database error: logged, loop continues; the lock may go stale and
-  be taken over if the outage outlasts the staleness window.
-- Heartbeat reports lost ownership: heartbeat exits and the worker stands down.
+- Heartbeat database error: logged, loop continues. If the heartbeat cannot
+  refresh for longer than the stale-lock window, lease loss is signalled and
+  the active work task is cancelled.
+- Heartbeat reports lost ownership: lease loss is signalled, the active work
+  task is cancelled, and `BackgroundJobLeaseLostError` is raised.
 - Release failure: logged; the row is left to expire via the staleness path.
 
 Because a lost or stale lock leads to takeover rather than deadlock, a crashed

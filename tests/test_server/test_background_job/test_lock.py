@@ -1,6 +1,7 @@
 """Tests for fact_inventory.server.background_job.lock."""
 
 import asyncio
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -8,7 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fact_inventory.infrastructure.db.models import BackgroundJobLock
 from fact_inventory.infrastructure.db.repositories import BackgroundJobLockRepository
-from fact_inventory.server.background_job import run_exclusive_background_job
+from fact_inventory.server.background_job import (
+    BackgroundJobLeaseLostError,
+    run_exclusive_background_job,
+)
+from fact_inventory.server.background_job.lock import _heartbeat
 from tests.fixtures.app import get_sqlalchemy_config
 
 DEFAULT_INTERVAL_SECONDS = 60
@@ -253,7 +258,7 @@ async def test_run_exclusive_heartbeat_warns_when_lock_disappears(
     test_client,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The heartbeat logs a warning if the lock row vanishes while work runs."""
+    """The heartbeat cancels work and logs a warning if the lock row vanishes."""
     alchemy_config = get_sqlalchemy_config(test_client.app)
     await _release_all_locks(test_db_session)
 
@@ -262,15 +267,8 @@ async def test_run_exclusive_heartbeat_warns_when_lock_disappears(
 
     async def long_work() -> int:
         started.set()
-        await asyncio.sleep(0.7)
-        async with alchemy_config.get_session() as session:
-            lock = await _get_lock(session, "disappear-job")
-            assert lock is not None
-            await BackgroundJobLockRepository(session=session).release(
-                "disappear-job", lock.owner_token
-            )
         await stop_work.wait()
-        return 42
+        return 0
 
     task = asyncio.create_task(
         run_exclusive_background_job(
@@ -282,28 +280,31 @@ async def test_run_exclusive_heartbeat_warns_when_lock_disappears(
     )
 
     await asyncio.wait_for(started.wait(), timeout=2)
-    with caplog.at_level("WARNING"):
-        await asyncio.sleep(1.2)
+    lock = await _get_lock(test_db_session, "disappear-job")
+    assert lock is not None
+    async with alchemy_config.get_session() as session:
+        await BackgroundJobLockRepository(session=session).release(
+            "disappear-job", lock.owner_token
+        )
+
+    with caplog.at_level("WARNING"), pytest.raises(BackgroundJobLeaseLostError):
+        await asyncio.wait_for(task, timeout=2)
 
     assert "was lost" in caplog.text
-
-    stop_work.set()
-    result = await asyncio.wait_for(task, timeout=2)
-    assert result == 42
+    await assert_lock_count(test_db_session, 0)
 
 
-async def test_run_exclusive_heartbeat_logs_refresh_failure(
+async def test_run_exclusive_heartbeat_failure_past_stale_window_cancels_work(
     test_db_session: AsyncSession,
     test_client,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The heartbeat logs exceptions from the refresh operation and continues."""
+    """A heartbeat refresh outage past the stale window cancels work."""
     alchemy_config = get_sqlalchemy_config(test_client.app)
     await _release_all_locks(test_db_session)
 
     started = asyncio.Event()
-    stop_work = asyncio.Event()
 
     async def failing_refresh(self, _name: str, _owner_token) -> None:
         msg = "heartbeat refresh failed"
@@ -315,10 +316,12 @@ async def test_run_exclusive_heartbeat_logs_refresh_failure(
         failing_refresh,
     )
 
+    stop_work = asyncio.Event()
+
     async def long_work() -> int:
         started.set()
         await stop_work.wait()
-        return 42
+        return 0
 
     task = asyncio.create_task(
         run_exclusive_background_job(
@@ -330,14 +333,14 @@ async def test_run_exclusive_heartbeat_logs_refresh_failure(
     )
 
     await asyncio.wait_for(started.wait(), timeout=2)
-    with caplog.at_level("ERROR"):
-        await asyncio.sleep(0.7)
+    with caplog.at_level("WARNING"):
+        await asyncio.sleep(2.1)
 
     assert "Heartbeat failed for background job" in caplog.text
+    assert "treating as lease loss" in caplog.text
 
-    stop_work.set()
-    result = await asyncio.wait_for(task, timeout=2)
-    assert result == 42
+    with pytest.raises(BackgroundJobLeaseLostError):
+        await asyncio.wait_for(task, timeout=2)
 
 
 async def test_run_exclusive_release_failure_is_logged(
@@ -373,3 +376,202 @@ async def test_run_exclusive_release_failure_is_logged(
 
     assert result == 5
     assert "Failed to release background job lock" in caplog.text
+
+
+async def test_run_exclusive_cancels_work_when_lease_lost(
+    test_db_session: AsyncSession,
+    test_client,
+) -> None:
+    """Deleting the lock row while work runs cancels the work task."""
+    alchemy_config = get_sqlalchemy_config(test_client.app)
+    await _release_all_locks(test_db_session)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    stop_work = asyncio.Event()
+
+    async def long_work() -> int:
+        started.set()
+        try:
+            await stop_work.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return 0
+
+    task = asyncio.create_task(
+        run_exclusive_background_job(
+            alchemy_config=alchemy_config,
+            name="lease-lost-cancel-job",
+            interval_seconds=1,
+            work=long_work,
+        )
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    lock = await _get_lock(test_db_session, "lease-lost-cancel-job")
+    assert lock is not None
+
+    async with alchemy_config.get_session() as session:
+        await BackgroundJobLockRepository(session=session).release(
+            "lease-lost-cancel-job", lock.owner_token
+        )
+
+    with pytest.raises(BackgroundJobLeaseLostError):
+        await asyncio.wait_for(task, timeout=2)
+
+    assert cancelled.is_set()
+    await assert_lock_count(test_db_session, 0)
+
+
+async def test_run_exclusive_cancels_work_when_heartbeat_outage_exceeds_stale_window(
+    test_db_session: AsyncSession,
+    test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat refresh outage past the stale window cancels work."""
+    alchemy_config = get_sqlalchemy_config(test_client.app)
+    await _release_all_locks(test_db_session)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    stop_work = asyncio.Event()
+
+    async def failing_refresh(self, _name: str, _owner_token) -> None:
+        msg = "heartbeat refresh failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        BackgroundJobLockRepository,
+        "refresh",
+        failing_refresh,
+    )
+
+    async def long_work() -> int:
+        started.set()
+        try:
+            await stop_work.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return 0
+
+    task = asyncio.create_task(
+        run_exclusive_background_job(
+            alchemy_config=alchemy_config,
+            name="heartbeat-outage-cancel-job",
+            interval_seconds=1,
+            work=long_work,
+        )
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.sleep(2.1)
+
+    with pytest.raises(BackgroundJobLeaseLostError):
+        await asyncio.wait_for(task, timeout=2)
+
+    assert cancelled.is_set()
+    await assert_lock_count(test_db_session, 0)
+
+
+async def test_run_exclusive_two_worker_takeover_cancels_first_worker(
+    test_db_session: AsyncSession,
+    test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second worker taking over a stale lock cancels the first worker."""
+    alchemy_config = get_sqlalchemy_config(test_client.app)
+    await _release_all_locks(test_db_session)
+
+    worker1_started = asyncio.Event()
+    worker1_cancelled = asyncio.Event()
+    stop_work = asyncio.Event()
+
+    async def worker1_work() -> int:
+        worker1_started.set()
+        try:
+            await stop_work.wait()
+        except asyncio.CancelledError:
+            worker1_cancelled.set()
+            raise
+        return 0
+
+    # Start worker1 with a 1s interval (heartbeat every 0.5s, stale after 2s).
+    worker1_task = asyncio.create_task(
+        run_exclusive_background_job(
+            alchemy_config=alchemy_config,
+            name="takeover-job",
+            interval_seconds=1,
+            work=worker1_work,
+        )
+    )
+    await asyncio.wait_for(worker1_started.wait(), timeout=2)
+
+    lock = await _get_lock(test_db_session, "takeover-job")
+    assert lock is not None
+    worker1_token = lock.owner_token
+
+    block_worker1 = asyncio.Event()
+    real_refresh = BackgroundJobLockRepository.refresh
+
+    async def patched_refresh(
+        self, name: str, owner_token: UUID
+    ) -> BackgroundJobLock | None:
+        if owner_token == worker1_token and block_worker1.is_set():
+            raise RuntimeError("worker1 heartbeat blocked")
+        return await real_refresh(self, name, owner_token)
+
+    monkeypatch.setattr(
+        BackgroundJobLockRepository,
+        "refresh",
+        patched_refresh,
+    )
+
+    # Block worker1's heartbeat and wait past the stale window.
+    block_worker1.set()
+    await asyncio.sleep(2.1)
+
+    async def worker2_work() -> int:
+        return 99
+
+    worker2_task = asyncio.create_task(
+        run_exclusive_background_job(
+            alchemy_config=alchemy_config,
+            name="takeover-job",
+            interval_seconds=1,
+            work=worker2_work,
+        )
+    )
+
+    result2 = await asyncio.wait_for(worker2_task, timeout=2)
+    assert result2 == 99
+
+    # Unblock worker1 so its next heartbeat detects the takeover.
+    block_worker1.clear()
+
+    with pytest.raises(BackgroundJobLeaseLostError):
+        await asyncio.wait_for(worker1_task, timeout=2)
+
+    assert worker1_cancelled.is_set()
+
+
+async def test_heartbeat_exits_immediately_when_stop_event_already_set(
+    test_client,
+) -> None:
+    """The heartbeat exits immediately when stop_event is already set."""
+    alchemy_config = get_sqlalchemy_config(test_client.app)
+    stop_event = asyncio.Event()
+    lease_lost_event = asyncio.Event()
+    stop_event.set()
+
+    await _heartbeat(
+        alchemy_config=alchemy_config,
+        name="stopped-heartbeat-job",
+        owner_token=uuid4(),
+        interval_seconds=DEFAULT_INTERVAL_SECONDS,
+        stop_event=stop_event,
+        lease_lost_event=lease_lost_event,
+    )
+
+    assert not lease_lost_event.is_set()

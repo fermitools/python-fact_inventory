@@ -11,7 +11,9 @@ worker's lock.
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Callable, Coroutine
+from typing import Any
 from uuid import UUID
 
 from advanced_alchemy.extensions.litestar import SQLAlchemyAsyncConfig
@@ -20,17 +22,33 @@ from fact_inventory.infrastructure.db.repositories.background_job_lock import (
     BackgroundJobLockRepository,
 )
 
-__all__ = ["run_exclusive_background_job"]
+__all__ = ["BackgroundJobLeaseLostError", "run_exclusive_background_job"]
 
 logger = logging.getLogger(__name__)
 
 
-async def _heartbeat(
+class BackgroundJobLeaseLostError(Exception):
+    """Raised when a background job loses its distributed lock while running."""
+
+    def __init__(self, name: str) -> None:
+        """Initialize with the job name that lost its lock.
+
+        Parameters
+        ----------
+        name : str
+            Job name that lost the lock.
+        """
+        super().__init__(f"Background job {name} lost its exclusive lock")
+        self.name = name
+
+
+async def _heartbeat(  # noqa: PLR0913, PLR0917
     alchemy_config: SQLAlchemyAsyncConfig,
     name: str,
     owner_token: UUID,
     interval_seconds: int,
     stop_event: asyncio.Event,
+    lease_lost_event: asyncio.Event,
 ) -> None:
     """Periodically refresh the lock row while the job is running.
 
@@ -38,6 +56,10 @@ async def _heartbeat(
     ``acquired_at`` to the current UTC time. Refreshes are conditional on
     the owner's token, preventing an old worker from changing a replacement
     worker's lock.
+
+    If the lock is taken over by another worker, or if the heartbeat is
+    unable to refresh for longer than the stale-lock window, the heartbeat
+    sets ``lease_lost_event`` so the active work task can be cancelled.
 
     Parameters
     ----------
@@ -51,10 +73,17 @@ async def _heartbeat(
     stop_event : asyncio.Event
         Event set by the caller when the job finishes, signalling the
         heartbeat to exit.
+    lease_lost_event : asyncio.Event
+        Event set when this worker no longer owns the lock.
     """
     heartbeat_interval = interval_seconds / 2
+    stale_threshold_seconds = 2 * interval_seconds
+    last_successful_refresh = time.monotonic()
 
-    while not stop_event.is_set():
+    while True:
+        if stop_event.is_set():
+            return
+
         try:
             async with asyncio.timeout(heartbeat_interval):
                 await stop_event.wait()
@@ -70,16 +99,26 @@ async def _heartbeat(
                 )
                 if refreshed is None:
                     logger.warning("Background job lock %s was lost", name)
+                    lease_lost_event.set()
                     return
+                last_successful_refresh = time.monotonic()
         except Exception:
             logger.exception("Heartbeat failed for background job %s", name)
+            if time.monotonic() - last_successful_refresh > stale_threshold_seconds:
+                logger.warning(
+                    "Background job heartbeat for %s has been unable to refresh "
+                    "for longer than the stale-lock window; treating as lease loss",
+                    name,
+                )
+                lease_lost_event.set()
+                return
 
 
 async def run_exclusive_background_job(
     alchemy_config: SQLAlchemyAsyncConfig,
     name: str,
     interval_seconds: int,
-    work: Callable[[], Awaitable[int]],
+    work: Callable[[], Coroutine[Any, Any, int]],
 ) -> int:
     """Run ``work`` if no other instance of ``name`` currently holds the lock.
 
@@ -87,6 +126,10 @@ async def run_exclusive_background_job(
     the supplied coroutine, and releases its own lock in ``finally``. If the
     lock cannot be acquired because another invocation is running, the
     function returns ``0`` immediately.
+
+    If the heartbeat detects that the lock was lost or that it has been
+    unable to refresh for longer than the stale-lock window, the active work
+    task is cancelled and :class:`BackgroundJobLeaseLostError` is raised.
 
     Parameters
     ----------
@@ -97,7 +140,7 @@ async def run_exclusive_background_job(
     interval_seconds : int
         Configured run interval for the job. Must be positive. Staleness is
         twice this value, and the heartbeat fires at half this value.
-    work : Callable[[], Awaitable[int]]
+    work : Callable[[], Coroutine[Any, Any, int]]
         Coroutine that performs the actual job work and returns the number
         of records processed.
 
@@ -112,6 +155,8 @@ async def run_exclusive_background_job(
     ValueError
         If ``interval_seconds`` is not positive. A non-positive interval makes
         every existing lock immediately stale, defeating mutual exclusion.
+    BackgroundJobLeaseLostError
+        If the lock is lost while ``work`` is still running.
 
     Notes
     -----
@@ -138,9 +183,13 @@ async def run_exclusive_background_job(
         return 0
 
     stop_event = asyncio.Event()
+    lease_lost_event = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
+    work_task: asyncio.Task[int] | None = None
+    lease_lost_wait_task: asyncio.Task[bool] | None = None
 
     try:
+        work_task = asyncio.create_task(work(), name=f"{name}-work")
         heartbeat_task = asyncio.create_task(
             _heartbeat(
                 alchemy_config,
@@ -148,12 +197,35 @@ async def run_exclusive_background_job(
                 owner_token,
                 interval_seconds,
                 stop_event,
+                lease_lost_event,
             ),
             name=f"{name}-heartbeat",
         )
-        return await work()
+        lease_lost_wait_task = asyncio.create_task(
+            lease_lost_event.wait(), name=f"{name}-lease-wait"
+        )
+
+        assert work_task is not None  # noqa: S101
+        assert lease_lost_wait_task is not None  # noqa: S101
+        done, _pending = await asyncio.wait(
+            [work_task, lease_lost_wait_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if work_task in done:
+            return work_task.result()
+
+        # Lease was lost before work completed.
+        work_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await work_task
+        raise BackgroundJobLeaseLostError(name)
     finally:
         stop_event.set()
+        if lease_lost_wait_task is not None and not lease_lost_wait_task.done():
+            lease_lost_wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lease_lost_wait_task
         if heartbeat_task is not None:
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(heartbeat_task, timeout=5)
