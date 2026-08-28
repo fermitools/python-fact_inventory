@@ -86,11 +86,11 @@ def test_json_payload_size_validator_validate_size_oversized_raises() -> None:
 def test_json_payload_size_validator_instances_are_independent() -> None:
     """Separate instances maintain independent limits."""
     v1 = build_validator(ONE_MB_LIMIT)
-    v2 = build_validator(10.0)
+    v2 = build_validator(10.1)
     # ~2 MB payload: json.dumps({"x": "y"*2_000_000}) is ~2_000_009 bytes
     large = json.dumps({"x": "y" * 2_000_000}).encode()
     assert v1.is_valid_size(large) is False, "v1 (1 MB) should reject ~2 MB payload"
-    assert v2.is_valid_size(large) is True, "v2 (10 MB) should accept ~2 MB payload"
+    assert v2.is_valid_size(large) is True, "v2 (10.1 MB) should accept ~2 MB payload"
 
 
 def test_json_payload_size_validator_validate_json_fields_success() -> None:

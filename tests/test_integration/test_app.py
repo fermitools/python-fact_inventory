@@ -27,6 +27,7 @@ from tests.factories import (
     create_payload_with_oversized_field,
     create_valid,
 )
+from tests.fixtures.app import clean_test_client
 from tests.support.http import assert_status, post_facts
 
 
@@ -380,7 +381,7 @@ async def test_app_startup_blocked_when_migrations_out_of_date() -> None:
         ),
         pytest.raises(ExceptionGroup) as exc_info,
     ):
-        async with AsyncTestClient(app=create_app()):
+        async with clean_test_client(create_app()):
             pytest.fail("startup unexpectedly succeeded")
 
     assert exc_info.value.subgroup(MigrationNotUpToDateError) is not None

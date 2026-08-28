@@ -500,7 +500,7 @@ class Settings(BaseSettings):
         so there is room for the surrounding JSON envelope and other request
         overhead. Requiring max_request_body_mb > N * max_json_field_mb preserves
         this invariant regardless of the chosen field size, where N is the number
-        of JSON field names defined in JSONFieldSizeConstraint.
+        of JSON field names defined in JsonPayloadSizeValidator.
 
         Returns
         -------

@@ -59,7 +59,10 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--strict --cov=fact_inventory -n auto"
 filterwarnings = [
-  "ignore::DeprecationWarning:advanced_alchemy",
+  "ignore:Call to deprecated function 'set_async_context':DeprecationWarning:advanced_alchemy",
+  "ignore:'click\\.utils\\.get_binary_stream' is deprecated:DeprecationWarning",
+  "ignore:'click\\.utils\\.get_text_stream' is deprecated:DeprecationWarning",
+  "ignore:'click\\.utils\\.PacifyFlushWrapper' is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]

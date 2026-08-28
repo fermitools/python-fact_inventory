@@ -87,7 +87,7 @@ async def _dispose_app_engine(app: Litestar) -> None:
     ``RuntimeError: Event loop is closed`` warning.
     """
     config = get_sqlalchemy_config(app)
-    engine = getattr(config, "engine", None)
+    engine = getattr(config, "engine_instance", None)
     if engine is not None:
         await engine.dispose()
 
@@ -96,8 +96,9 @@ async def _dispose_app_engine(app: Litestar) -> None:
 async def clean_test_client(app: Litestar) -> AsyncGenerator[AsyncTestClient, None]:
     """Provide an app client with database and engine cleanup.
 
-    Engine disposal runs before client shutdown to avoid the aiosqlite worker
-    thread trying to access a closed event loop.
+    Engine disposal runs after the client shuts down so the app's lifespan
+    exits first, then the aiosqlite worker thread is stopped before the
+    event loop closes.
     """
     try:
         async with AsyncTestClient(app=app) as test_client:
@@ -106,10 +107,8 @@ async def clean_test_client(app: Litestar) -> AsyncGenerator[AsyncTestClient, No
                 yield test_client
             finally:
                 await cleanup_app_database(test_client.app)
-                await _dispose_app_engine(app)
-    except GeneratorExit:
+    finally:
         await _dispose_app_engine(app)
-        raise
 
 
 @pytest.fixture

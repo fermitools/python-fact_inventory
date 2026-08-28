@@ -82,7 +82,7 @@ class JsonPayloadSizeValidator:
         FactPayloadTooLargeError
             If field exceeds size limit.
         """
-        serialized = json.dumps(value).encode("utf-8")
+        serialized = json.dumps(value, ensure_ascii=False).encode("utf-8")
         if not self.is_valid_size(serialized):
             size_mb = len(serialized) / (1024 * 1024)
             raise FactPayloadTooLargeError(  # noqa: TRY003
