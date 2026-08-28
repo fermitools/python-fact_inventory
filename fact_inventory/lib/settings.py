@@ -51,6 +51,20 @@ DB_POOL_MAX_OVERFLOW
 DB_POOL_TIMEOUT
     Seconds to wait for a connection from the pool. Default: 30. Valid: >=1.
 
+DB_POOL_RECYCLE_SECONDS
+    Seconds before a pooled connection is recycled. Lower this if an
+    intermediate firewall or load balancer silently drops idle connections
+    before this interval elapses. Default: 3600. Valid: 60-86400.
+    PostgreSQL only; ignored for SQLite.
+
+DB_STATEMENT_TIMEOUT_MS
+    Milliseconds before PostgreSQL aborts a running statement on any
+    connection from this application. Applied via asyncpg server_settings at
+    connection startup, so it covers every query (requests and background
+    jobs), not just retention deletes. Default: 60000. Valid: 0-3600000.
+    0 disables the timeout (PostgreSQL default: no limit).
+    PostgreSQL only; ignored for SQLite.
+
 **Rate Limiting**
 
 API_RATE_LIMIT_UNIT
@@ -291,6 +305,24 @@ class Settings(BaseSettings):
         default=30,
         ge=1,
         description="Seconds to wait for a connection from the pool.",
+    )
+    db_pool_recycle_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description=(
+            "Seconds before a pooled connection is recycled. PostgreSQL only."
+        ),
+    )
+    db_statement_timeout_ms: int = Field(
+        default=60000,
+        ge=0,
+        le=3_600_000,
+        description=(
+            "Milliseconds before PostgreSQL aborts a running statement on any"
+            " connection from this application. 0 disables the timeout."
+            " PostgreSQL only."
+        ),
     )
 
     api_rate_limit_unit: DurationUnit = Field(

@@ -23,6 +23,7 @@ from litestar.status_codes import (
 )
 from litestar.testing import AsyncTestClient
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from fact_inventory.application.services.fact import FactInventoryService
 from fact_inventory.lib.settings import get_settings
@@ -140,6 +141,17 @@ SERVICE_ERROR_CASES = [
         HTTP_504_GATEWAY_TIMEOUT,
         "timeout",
         id="timeout-error",
+    ),
+    pytest.param(
+        # sqlalchemy.exc.TimeoutError (e.g. connection pool exhaustion) does
+        # NOT subclass the builtin TimeoutError -- it subclasses
+        # SQLAlchemyError instead. Without an explicit handler registration
+        # for this exact class, it would incorrectly resolve to the generic
+        # SQLAlchemyError -> 500 handler rather than the 504 timeout handler.
+        SQLAlchemyTimeoutError("pool timeout"),
+        HTTP_504_GATEWAY_TIMEOUT,
+        "timeout",
+        id="sqlalchemy-timeout-error",
     ),
     pytest.param(
         AAIntegrityError("duplicate key"),

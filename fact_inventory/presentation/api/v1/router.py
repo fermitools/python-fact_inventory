@@ -6,6 +6,7 @@ from advanced_alchemy.exceptions import RepositoryError
 from litestar import Router
 from litestar.di import NamedDependency, Provide
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fact_inventory.application.services.fact import FactInventoryService
@@ -45,6 +46,12 @@ def create_v1_router(settings: Settings | None = None) -> Router:
             FactPayloadTooLargeError: fact_payload_too_large_error_handler,
             RepositoryError: repository_error_handler,
             SQLAlchemyError: sqlalchemy_error_handler,
+            # sqlalchemy.exc.TimeoutError (e.g. connection pool exhaustion) does
+            # NOT subclass the builtin TimeoutError -- it subclasses
+            # SQLAlchemyError instead. Both must be registered explicitly so
+            # pool-timeout errors resolve to the 504 handler instead of falling
+            # through to the generic SQLAlchemyError -> 500 handler.
+            SQLAlchemyTimeoutError: timeout_error_handler,
             TimeoutError: timeout_error_handler,
         },
     )

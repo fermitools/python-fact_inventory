@@ -39,7 +39,7 @@ Gunicorn can manage uvicorn workers for production deployments. This provides pr
 export WEB_CONCURRENCY=8
 gunicorn fact_inventory:app_factory \
   --factory \
-  --worker-class uvicorn.workers.UvicornWorker \
+  --worker-class uvicorn_worker.UvicornWorker \
   --bind 0.0.0.0:8000 \
   --workers ${WEB_CONCURRENCY:-4}
 ```
@@ -63,7 +63,7 @@ Environment="DATABASE_URI=postgresql+asyncpg://user:pass@localhost/fact_inventor
 ExecStart=/opt/fact-inventory/.venv/bin/gunicorn \
   fact_inventory:app_factory \
   --factory \
-  --worker-class uvicorn.workers.UvicornWorker \
+  --worker-class uvicorn_worker.UvicornWorker \
   --bind 127.0.0.1:8000 \
   --workers ${WEB_CONCURRENCY:-4}
 Restart=always
@@ -90,14 +90,14 @@ For high-concurrency I/O workloads, consider async workers (requires gthread wor
 WEB_CONCURRENCY=2 gunicorn \
   fact_inventory:app_factory \
   --factory \
-  --worker-class uvicorn.workers.UvicornWorker \
+  --worker-class uvicorn_worker.UvicornWorker \
   --bind 0.0.0.0:8000 \
   --workers ${WEB_CONCURRENCY} \
   --threads 4 \
   --timeout 30
 ```
 
-> **Note**: The `uvicorn.workers.UvicornWorker` class allows gunicorn to manage uvicorn's ASGI server as subprocesses.
+> **Note**: The `uvicorn_worker.UvicornWorker` class allows gunicorn to manage uvicorn's ASGI server as subprocesses.
 
 ### Gunicorn Configuration File
 
@@ -107,7 +107,7 @@ Create `gunicorn.conf.py`:
 import multiprocessing
 
 workers = multiprocessing.cpu_count() * 2 + 1
-worker_class = "uvicorn.workers.UvicornWorker"
+worker_class = "uvicorn_worker.UvicornWorker"
 bind = "0.0.0.0:8000"
 timeout = 30
 keep_alive = 5

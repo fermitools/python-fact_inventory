@@ -96,9 +96,10 @@ def create_app(settings: Settings | None = None) -> Litestar:
         debug=settings.debug,
         pool_settings={
             "pool_size": settings.db_pool_size,
-            "pool_recycle": 3600,
+            "pool_recycle": settings.db_pool_recycle_seconds,
             "max_overflow": settings.db_pool_max_overflow,
             "pool_timeout": settings.db_pool_timeout,
+            "statement_timeout_ms": settings.db_statement_timeout_ms,
         },
     )
 

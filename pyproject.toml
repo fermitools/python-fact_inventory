@@ -73,7 +73,7 @@ omit = ["fact_inventory/__main__.py", "fact_inventory/asgi.py", "fact_inventory/
 [tool.coverage.report]
 show_missing = true
 skip_empty = true
-fail_under = 95
+fail_under = 97
 exclude_lines = [
   "if __name__ == .__main__.:",
   "pragma: no cover",

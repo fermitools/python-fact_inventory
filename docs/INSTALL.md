@@ -97,6 +97,16 @@ Example with local PostgreSQL:
 export DATABASE_URI="postgresql+asyncpg://fact_user:secure_password@localhost:5432/fact_inventory"
 ```
 
+**Connection pool and statement timeout** (PostgreSQL only; ignored for SQLite):
+
+`DB_POOL_RECYCLE_SECONDS` recycles pooled connections after N seconds (lower
+this if a firewall or load balancer silently drops idle connections sooner).
+`DB_STATEMENT_TIMEOUT_MS` aborts any single statement that runs longer than N
+milliseconds, applied to every query on the connection (API requests and
+background cleanup jobs alike); 0 disables the timeout. See
+[../fact_inventory/lib/settings.py](../fact_inventory/lib/settings.py) for
+current defaults and valid ranges.
+
 ### Rate Limiting
 
 Rate limiting is configured with two environment variables. The default is 2 requests per hour per IP address. Rate limiting is based on the client's IP address and can be bypassed with IP rotation.

@@ -1,4 +1,11 @@
-"""Handler for TimeoutError."""
+"""Handler for timeout errors.
+
+Handles both the builtin ``TimeoutError`` and ``sqlalchemy.exc.TimeoutError``
+(e.g. connection pool exhaustion). The two are unrelated exception
+hierarchies -- ``sqlalchemy.exc.TimeoutError`` subclasses
+``sqlalchemy.exc.SQLAlchemyError``, not the builtin -- so this handler must be
+registered under both exception classes in the router's exception_handlers map.
+"""
 
 from typing import Any
 
@@ -15,7 +22,7 @@ __all__ = ["timeout_error_handler"]
 
 def timeout_error_handler(
     request: Any,
-    exc: TimeoutError,
+    exc: Exception,
 ) -> Response[dict[str, Any]]:
     """Map timeout failures to HTTP 504."""
     request.logger.error(

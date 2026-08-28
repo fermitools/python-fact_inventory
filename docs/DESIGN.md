@@ -17,9 +17,13 @@ All route handlers are defined within the `presentation/` subpackage.
 The standalone application factory (`create_app` in `fact_inventory.server.app`) serves them at the root path `/`
 by default (suitable for production behind a reverse proxy that strips the prefix).
 
-The `app_factory` symbol in `fact_inventory.server.app` is the actual application factory function.
-The `app` symbol in `fact_inventory` is a lazy proxy that defers configuration loading
-until the application is actually used.
+`create_app` in `fact_inventory.server.app` is the actual application factory function.
+`fact_inventory.app_factory` is an alias for it, intended for use with an ASGI
+server's factory mode (e.g. `uvicorn fact_inventory:app_factory --factory`);
+using factory mode defers configuration loading until the server calls it.
+`fact_inventory.app` is an eagerly-constructed instance (`create_app()` called
+at import time) and therefore requires configuration to already be set
+before the module is imported.
 
 When embedding in a larger Litestar application, pass a custom prefix to `create_router` in `fact_inventory.presentation.router`:
 
@@ -58,8 +62,8 @@ All optional endpoints are disabled by default. Enable them via environment vari
 The API router (`fact_inventory/presentation/api/router.py`) applies rate limiting to all `/api/v1/*` routes.
 The unversioned non-API routes (`/`, `/health`, `/ready`, `/metrics`) are excluded from rate limiting.
 
-- **Controller Layer** (`fact_inventory/presentation/api/v1/controller.py`): HTTP endpoint handlers with request validation. The controller is responsible only for validation and persistence.
-- **Service Layer** (`fact_inventory/application/services.py`): Business logic without database-specific behavior. Perform JSON field size validation to enforce policy constraints.
+- **Controller Layer** (`fact_inventory/presentation/api/v1/factcontroller.py`): HTTP endpoint handlers with request validation. The controller is responsible only for validation and persistence.
+- **Service Layer** (`fact_inventory/application/services/fact.py`): Business logic without database-specific behavior. Perform JSON field size validation to enforce policy constraints.
 - **Response Models** (`fact_inventory/presentation/api/v1/schemas/responses.py`): Pydantic response envelopes for the v1 API.
 
 #### /api/v1/facts
@@ -176,6 +180,24 @@ It returns the created record and raises `RepositoryError` or `SQLAlchemyError` 
 - `ix_fact_inventory_package_facts`: GIN index for efficient JSONB queries (GIN is PostgreSQL only).
 - `ix_fact_inventory_local_facts`: GIN index for efficient JSONB queries (GIN is PostgreSQL only).
 - `ix_fact_inventory_client_facts`: GIN index for efficient JSONB queries (GIN is PostgreSQL only).
+
+#### Connection Pool & Statement Timeout
+
+Pool sizing (`DB_POOL_SIZE`, `DB_POOL_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`) and
+`DB_POOL_RECYCLE_SECONDS` are applied to the SQLAlchemy engine's connection
+pool. `DB_POOL_RECYCLE_SECONDS` (default 3600) should be lowered if an
+intermediate firewall or load balancer silently drops idle TCP connections
+before that interval elapses, to avoid intermittent `OperationalError`s from
+stale pooled connections.
+
+`DB_STATEMENT_TIMEOUT_MS` (default 60000, 0 disables) sets PostgreSQL's
+`statement_timeout` via asyncpg's `server_settings`, applied once at
+connection startup rather than per-query or per-transaction. PostgreSQL then
+enforces the cap on every statement issued over that connection -- API
+request inserts and background-job deletes alike -- and the setting is
+automatically reapplied whenever the pool opens a fresh connection (e.g.
+after `DB_POOL_RECYCLE_SECONDS` elapses). Both settings are PostgreSQL-only;
+SQLite (development/test only) ignores them.
 
 ## Plugins
 

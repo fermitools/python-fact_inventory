@@ -168,6 +168,42 @@ def test_settings_body_size_invalid_rejected(body_mb: int) -> None:
         )
 
 
+@pytest.mark.parametrize("pool_recycle_seconds", [60, 3600, 86400])
+def test_settings_db_pool_recycle_seconds_valid_accepted(
+    pool_recycle_seconds: int,
+) -> None:
+    """db_pool_recycle_seconds within [60, 86400] is accepted."""
+    s = build_settings(db_pool_recycle_seconds=pool_recycle_seconds)
+    assert s.db_pool_recycle_seconds == pool_recycle_seconds
+
+
+@pytest.mark.parametrize("pool_recycle_seconds", [0, 59, 86401])
+def test_settings_db_pool_recycle_seconds_invalid_rejected(
+    pool_recycle_seconds: int,
+) -> None:
+    """db_pool_recycle_seconds outside [60, 86400] is rejected."""
+    with pytest.raises(ValueError):
+        build_settings(db_pool_recycle_seconds=pool_recycle_seconds)
+
+
+@pytest.mark.parametrize("statement_timeout_ms", [0, 60000, 3_600_000])
+def test_settings_db_statement_timeout_ms_valid_accepted(
+    statement_timeout_ms: int,
+) -> None:
+    """db_statement_timeout_ms within [0, 3600000] is accepted."""
+    s = build_settings(db_statement_timeout_ms=statement_timeout_ms)
+    assert s.db_statement_timeout_ms == statement_timeout_ms
+
+
+@pytest.mark.parametrize("statement_timeout_ms", [-1, 3_600_001])
+def test_settings_db_statement_timeout_ms_invalid_rejected(
+    statement_timeout_ms: int,
+) -> None:
+    """db_statement_timeout_ms outside [0, 3600000] is rejected."""
+    with pytest.raises(ValueError):
+        build_settings(db_statement_timeout_ms=statement_timeout_ms)
+
+
 def test_settings_version_explicit_overrides_detection() -> None:
     """Explicit version passed to Settings is used; _get_version is not called."""
     with patch("fact_inventory.lib.settings._get_version") as mock_get_version:
